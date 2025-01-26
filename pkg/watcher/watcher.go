@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"log"
 	"time"
 )
 
@@ -21,10 +22,34 @@ func NewServiceWatcher(ctx context.Context, projectID string) *GCPServiceWatcher
 
 func (w *GCPServiceWatcher) WatchServices(ctx context.Context, interval time.Duration) <-chan []string {
 	ch := make(chan []string)
+
 	go func() {
 		defer close(ch)
-		// TODO: Implement GCP Compute Engine instance group monitoring
-		ch <- []string{"service1", "service2"}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				services, err := w.fetchServices(ctx)
+				if err != nil {
+					log.Printf("Error fetching services: %v", err)
+					continue
+				}
+				ch <- services
+			}
+		}
 	}()
+
 	return ch
+}
+
+func (w *GCPServiceWatcher) fetchServices(context.Context) ([]string, error) {
+	// For now, return mock services. In production, you would:
+	// 1. Query GCP APIs to get service list
+	// 2. Filter based on criteria
+	// 3. Transform into the required format
+	return []string{"service1", "service2"}, nil
 }

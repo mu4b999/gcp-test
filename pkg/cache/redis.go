@@ -3,8 +3,10 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
+	"sync"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -30,6 +32,7 @@ type Config struct {
 type RedisCache struct {
 	client   *redis.Client
 	snapshot envoycache.SnapshotCache
+	mu       sync.RWMutex
 }
 
 // NewRedisCache creates a new Redis cache instance with the specified configuration
@@ -68,77 +71,52 @@ func NewRedisCache(ctx context.Context, cfg Config) (*RedisCache, error) {
 	}, nil
 }
 
-// Implements envoycache.Cache interface
-
-// func (rc *RedisCache) CreateWatch(req *envoycache.Request, state *stream.StreamState,
-// 	callback func(response envoycache.Response)) func() {
-// 	responseChan := make(chan envoycache.Response)
-// 	go func() {
-// 		for response := range responseChan {
-// 			callback(response)
-// 		}
-// 	}()
-// 	return rc.snapshot.CreateWatch(req, *state, responseChan)
-// }
-
 func (r *RedisCache) CreateWatch(req *envoycache.Request, state stream.StreamState, respond chan envoycache.Response) func() {
 	return r.snapshot.CreateWatch(req, state, respond)
 }
-
-// func (rc *RedisCache) CreateDeltaWatch(req *envoycache.DeltaRequest, state *stream.StreamState,
-// 	callback func(response envoycache.DeltaResponse)) func() {
-// 	responseChan := make(chan envoycache.DeltaResponse)
-// 	go func() {
-// 		for response := range responseChan {
-// 			callback(response)
-// 		}
-// 	}()
-// 	return rc.snapshot.CreateDeltaWatch(req, *state, responseChan)
-// }
-
-// func (rc *RedisCache) CreateDeltaWatch(req *envoycache.DeltaRequest, state *stream.StreamState, respond chan envoycache.DeltaResponse) func() {
-// 	return rc.snapshot.CreateDeltaWatch(req, *state, respond)
-// }
 
 func (r *RedisCache) CreateDeltaWatch(req *envoycache.DeltaRequest, state stream.StreamState, resp chan envoycache.DeltaResponse) func() {
 	return r.snapshot.CreateDeltaWatch(req, state, resp)
 }
 
-// ...existing code...
-
 func (rc *RedisCache) Fetch(ctx context.Context, req *envoycache.Request) (envoycache.Response, error) {
 	return rc.snapshot.Fetch(ctx, req)
 }
 
-// Implements SnapshotCache methods
+// In redis.go
+func (rc *RedisCache) SetSnapshot(nodeID string, snapshot envoycache.ResourceSnapshot) error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 
-func (rc *RedisCache) SetSnapshot(nodeID string, snapshot envoycache.Snapshot) error {
 	// Store in memory cache
-	if err := rc.snapshot.SetSnapshot(context.Background(), nodeID, &snapshot); err != nil {
+	if err := rc.snapshot.SetSnapshot(context.Background(), nodeID, snapshot); err != nil {
 		return fmt.Errorf("failed to set in-memory snapshot: %w", err)
 	}
 
-	// Backup to Redis
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		return fmt.Errorf("failed to marshal snapshot: %w", err)
+	// Store version info in Redis
+	ctx := context.Background()
+	versionKey := fmt.Sprintf("snapshot:%s:version", nodeID)
+
+	// Get version from the snapshot
+	versionMap := snapshot.GetVersionMap(versionKey)
+	version := ""
+	for _, v := range versionMap {
+		version = v
+		break
 	}
 
-	ctx := context.Background()
-	key := fmt.Sprintf("snapshot:%s", nodeID)
-	if err := rc.client.Set(ctx, key, data, 24*time.Hour).Err(); err != nil {
-		return fmt.Errorf("failed to store snapshot in redis: %w", err)
+	if err := rc.client.Set(ctx, versionKey, version, 24*time.Hour).Err(); err != nil {
+		return fmt.Errorf("failed to store version in redis: %w", err)
 	}
 
 	return nil
 }
 
 func (rc *RedisCache) GetSnapshot(nodeID string) (envoycache.ResourceSnapshot, error) {
-	resourceSnapshot, err := rc.snapshot.GetSnapshot(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	return resourceSnapshot, nil
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	return rc.snapshot.GetSnapshot(nodeID)
 }
 
 func (rc *RedisCache) ClearSnapshot(nodeID string) {
@@ -161,25 +139,37 @@ func (rc *RedisCache) Status(node *core.Node) envoycache.StatusInfo {
 }
 
 func (rc *RedisCache) GetResources(typeURL string) map[string]types.Resource {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
 	resources := make(map[string]types.Resource)
 
-	// Get all keys matching the typeURL pattern
+	// Get all node IDs with snapshots
 	ctx := context.Background()
-	keys, err := rc.client.Keys(ctx, fmt.Sprintf("resource:%s:*", typeURL)).Result()
+	pattern := "snapshot:*:version"
+	keys, err := rc.client.Keys(ctx, pattern).Result()
 	if err != nil {
-		return nil
+		log.Printf("Failed to get snapshot keys: %v", err)
+		return resources
 	}
 
-	// Fetch and unmarshal each resource
+	// For each node, get its snapshot and extract resources
 	for _, key := range keys {
-		data, err := rc.client.Get(ctx, key).Bytes()
+		// Extract node ID from key
+		nodeID := strings.TrimPrefix(key, "snapshot:")
+		nodeID = strings.TrimSuffix(nodeID, ":version")
+
+		// Get snapshot for this node
+		snapshot, err := rc.GetSnapshot(nodeID)
 		if err != nil {
 			continue
 		}
 
-		var resource types.Resource
-		if err := json.Unmarshal(data, &resource); err == nil {
-			resources[key] = resource
+		// Get resources of requested type from snapshot
+		if r := snapshot.GetResources(typeURL); r != nil {
+			for name, resource := range r {
+				resources[name] = resource
+			}
 		}
 	}
 
@@ -187,20 +177,41 @@ func (rc *RedisCache) GetResources(typeURL string) map[string]types.Resource {
 }
 
 func (rc *RedisCache) GetResourceVersions(typeURL string) map[string]string {
-	versions := make(map[string]string)
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
 
-	// Get all keys matching the typeURL pattern
-	ctx := context.Background()
-	keys, err := rc.client.Keys(ctx, fmt.Sprintf("resource:%s:*", typeURL)).Result()
+	versions := make(map[string]string)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Get all resource keys for this type
+	pattern := fmt.Sprintf("resource:%s:*", typeURL)
+	keys, err := rc.client.Keys(ctx, pattern).Result()
 	if err != nil {
-		return nil
+		log.Printf("Failed to get resource keys: %v", err)
+		return versions
 	}
 
-	// Fetch version for each resource
+	// Use pipelining for better performance
+	pipe := rc.client.Pipeline()
+	cmds := make(map[string]*redis.StringCmd)
+
 	for _, key := range keys {
-		version, err := rc.client.HGet(ctx, key, "version").Result()
+		cmds[key] = pipe.HGet(ctx, key, "version")
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		log.Printf("Failed to execute pipeline: %v", err)
+		return versions
+	}
+
+	for key, cmd := range cmds {
+		version, err := cmd.Result()
 		if err == nil {
-			versions[key] = version
+			// Extract resource name from key
+			name := strings.TrimPrefix(key, fmt.Sprintf("resource:%s:", typeURL))
+			versions[name] = version
 		}
 	}
 
