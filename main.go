@@ -11,7 +11,8 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/mu4b999/gcp-test/pkg/cache"
 	"github.com/mu4b999/gcp-test/pkg/controlplane"
-	"github.com/mu4b999/gcp-test/pkg/snapshotter"
+
+	// "github.com/mu4b999/gcp-test/pkg/snapshotter"
 	"github.com/mu4b999/gcp-test/pkg/watcher"
 	"google.golang.org/grpc"
 )
@@ -42,13 +43,13 @@ func main() {
 	}
 
 	// Initialize your snapshotter with the cache
-	snapshotter := snapshotter.NewGCPSnapshotter(ctx, "my-project")
+	// snapshotter := snapshotter.NewGCPSnapshotter(ctx, "my-project")
 
 	// Setup watchers
 	watcher := watcher.NewServiceWatcher(ctx, "my-project")
 
 	// Create the enhanced control plane
-	cp := controlplane.NewControlPlane(cache, snapshotter, watcher)
+	cp := controlplane.NewControlPlane(*cache, watcher)
 
 	// Create TCP listener
 	lis, err := net.Listen("tcp", ":18000")

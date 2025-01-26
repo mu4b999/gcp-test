@@ -1,33 +1,43 @@
+// Package controlplane provides a complete implementation of an Envoy xDS control plane
+// with support for dynamic service discovery and configuration updates.
 package controlplane
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
-
 	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
-	"github.com/mu4b999/gcp-test/pkg/cache"
-	"github.com/mu4b999/gcp-test/pkg/snapshotter"
+	rediscache "github.com/mu4b999/gcp-test/pkg/cache"
 	"github.com/mu4b999/gcp-test/pkg/watcher"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// ControlPlane manages the xDS server and configuration distribution.
 type ControlPlane struct {
-	gcpCache       cache.Cache
-	snapshotter    snapshotter.Snapshotter
-	serviceWatcher watcher.ServiceWatcher
-
-	// Track active streams
-	streams   map[int64]*streamState
-	streamsMu sync.RWMutex
+	gcpCache       rediscache.RedisCache  // Interface for configuration storage
+	serviceWatcher watcher.ServiceWatcher // Watches for service changes
+	streams        map[int64]*streamState // Tracks active xDS streams
+	streamsMu      sync.RWMutex           // Protects access to streams map
+	logger         *log.Logger            // Structured logging
 }
 
+// streamState tracks the state of individual xDS streams.
 type streamState struct {
 	nodeID    string
 	typeURL   string
@@ -35,55 +45,261 @@ type streamState struct {
 	resources map[string]types.Resource
 }
 
-func NewControlPlane(cache cache.Cache, snapshotter snapshotter.Snapshotter, watcher watcher.ServiceWatcher) *ControlPlane {
+// NewControlPlane creates a new control plane instance with proper initialization.
+func NewControlPlane(cache rediscache.RedisCache, watcher watcher.ServiceWatcher) *ControlPlane {
 	cp := &ControlPlane{
 		gcpCache:       cache,
-		snapshotter:    snapshotter,
 		serviceWatcher: watcher,
 		streams:        make(map[int64]*streamState),
+		logger:         log.New(os.Stdout, "[control-plane] ", log.LstdFlags),
 	}
 
-	// Start watching for service changes
-	go cp.watchServices(context.Background())
+	// Start service watching in a goroutine with proper context
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		cp.watchServices(ctx)
+		cancel() // Ensure context is canceled when watchServices exits
+	}()
 
 	return cp
 }
 
+// watchServices continuously monitors for service updates and triggers configuration updates.
 func (cp *ControlPlane) watchServices(ctx context.Context) {
-	serviceChan := cp.serviceWatcher.WatchServices(ctx, 30*time.Second)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case services := <-serviceChan:
-			if err := cp.handleServiceUpdate(ctx, services); err != nil {
-				log.Printf("Error handling service update: %v", err)
-			}
 		case <-ctx.Done():
+			cp.logger.Println("Service watching stopped")
 			return
+		case services := <-cp.serviceWatcher.WatchServices(ctx, 30*time.Second):
+			if err := cp.handleServiceUpdate(ctx, services); err != nil {
+				cp.logger.Printf("Error handling service update: %v", err)
+			}
+		case <-ticker.C:
+			// Periodic health check or cleanup could go here
 		}
 	}
 }
 
-func (cp *ControlPlane) handleServiceUpdate(ctx context.Context, services []string) error {
-	// Create a new snapshot with updated services
+// handleServiceUpdate processes service updates and updates configurations accordingly.
+func (cp *ControlPlane) handleServiceUpdate(ctx context.Context, services []watcher.ServiceDiscovery) error {
 	snapshot, err := cp.createSnapshot(services)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
-	// Update all active streams with new snapshot
 	cp.streamsMu.RLock()
 	defer cp.streamsMu.RUnlock()
 
 	for _, state := range cp.streams {
-		// snapshot is already a *envoycache.Snapshot which implements ResourceSnapshot
 		if err := cp.gcpCache.SetSnapshot(state.nodeID, snapshot); err != nil {
-			log.Printf("Failed to update snapshot for node %s: %v", state.nodeID, err)
+			cp.logger.Printf("Failed to update snapshot for node %s: %v", state.nodeID, err)
 		}
 	}
 
 	return nil
 }
+
+// createSnapshot generates a new configuration snapshot based on discovered services.
+func (cp *ControlPlane) createSnapshot(services []watcher.ServiceDiscovery) (*envoycache.Snapshot, error) {
+	version := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	clusters := make([]types.Resource, 0)
+	endpoints := make([]types.Resource, 0)
+
+	// Create cluster and endpoint configurations for each service
+	for _, service := range services {
+		// Create cluster configuration
+		cluster := &cluster.Cluster{
+			Name:           service.ServiceName,
+			ConnectTimeout: durationpb.New(5 * time.Second),
+			ClusterDiscoveryType: &cluster.Cluster_Type{
+				Type: cluster.Cluster_EDS,
+			},
+			EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+				EdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_Ads{},
+				},
+			},
+			LbPolicy: cluster.Cluster_ROUND_ROBIN,
+		}
+		clusters = append(clusters, cluster)
+
+		// Create endpoint configuration
+		loadAssignment := &endpoint.ClusterLoadAssignment{
+			ClusterName: service.ServiceName,
+			Endpoints: []*endpoint.LocalityLbEndpoints{
+				{
+					LbEndpoints: make([]*endpoint.LbEndpoint, 0, len(service.Endpoints)),
+				},
+			},
+		}
+
+		for _, ep := range service.Endpoints {
+			lbEndpoint := &endpoint.LbEndpoint{
+				HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+					Endpoint: &endpoint.Endpoint{
+						Address: &core.Address{
+							Address: &core.Address_SocketAddress{
+								SocketAddress: &core.SocketAddress{
+									Address: ep.IP,
+									PortSpecifier: &core.SocketAddress_PortValue{
+										PortValue: ep.Port,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			loadAssignment.Endpoints[0].LbEndpoints = append(
+				loadAssignment.Endpoints[0].LbEndpoints,
+				lbEndpoint,
+			)
+		}
+
+		endpoints = append(endpoints, loadAssignment)
+	}
+
+	// Create the snapshot with all configurations
+	snapshot, err := envoycache.NewSnapshot(
+		version,
+		map[resource.Type][]types.Resource{
+			resource.ClusterType:  clusters,
+			resource.EndpointType: endpoints,
+			resource.RouteType:    cp.createRoutes(services),
+			resource.ListenerType: cp.createListeners(services),
+		},
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	if err := snapshot.Consistent(); err != nil {
+		return nil, fmt.Errorf("inconsistent snapshot: %w", err)
+	}
+
+	return snapshot, nil
+}
+
+// createRoutes generates route configurations for all services.
+func (cp *ControlPlane) createRoutes(services []watcher.ServiceDiscovery) []types.Resource {
+	routeConfig := &route.RouteConfiguration{
+		Name: "main_route_config",
+		VirtualHosts: []*route.VirtualHost{
+			{
+				Name:    "all_services",
+				Domains: []string{"*"},
+				Routes:  make([]*route.Route, 0, len(services)),
+			},
+		},
+	}
+
+	for _, service := range services {
+		route := &route.Route{
+			Match: &route.RouteMatch{
+				PathSpecifier: &route.RouteMatch_Prefix{
+					Prefix: fmt.Sprintf("/%s/", service.ServiceName),
+				},
+			},
+			Action: &route.Route_Route{
+				Route: &route.RouteAction{
+					ClusterSpecifier: &route.RouteAction_Cluster{
+						Cluster: service.ServiceName,
+					},
+					Timeout: durationpb.New(15 * time.Second),
+					RetryPolicy: &route.RetryPolicy{
+						RetryOn:    "connect-failure,refused-stream,unavailable",
+						NumRetries: &wrapperspb.UInt32Value{Value: 3},
+						RetryBackOff: &route.RetryPolicy_RetryBackOff{
+							BaseInterval: durationpb.New(100 * time.Millisecond),
+							MaxInterval:  durationpb.New(1 * time.Second),
+						},
+					},
+				},
+			},
+		}
+		routeConfig.VirtualHosts[0].Routes = append(routeConfig.VirtualHosts[0].Routes, route)
+	}
+
+	return []types.Resource{routeConfig}
+}
+
+// createListeners generates listener configurations.
+func (cp *ControlPlane) createListeners(services []watcher.ServiceDiscovery) []types.Resource {
+	manager := &hcm.HttpConnectionManager{
+		CodecType:  hcm.HttpConnectionManager_AUTO,
+		StatPrefix: "ingress_http",
+		RouteSpecifier: &hcm.HttpConnectionManager_Rds{
+			Rds: &hcm.Rds{
+				ConfigSource: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_Ads{},
+				},
+				RouteConfigName: "main_route_config",
+			},
+		},
+		HttpFilters: []*hcm.HttpFilter{
+			{
+				Name: "envoy.filters.http.router",
+				ConfigType: &hcm.HttpFilter_TypedConfig{
+					TypedConfig: mustMarshalAny(&router.Router{}),
+				},
+			},
+		},
+		CommonHttpProtocolOptions: &core.HttpProtocolOptions{
+			IdleTimeout: durationpb.New(5 * time.Minute),
+		},
+	}
+
+	pbst, err := anypb.New(manager)
+	if err != nil {
+		cp.logger.Printf("Failed to marshal HTTP connection manager: %v", err)
+		return nil
+	}
+
+	listener := &listener.Listener{
+		Name: "main_listener",
+		Address: &core.Address{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
+					Address: "0.0.0.0",
+					PortSpecifier: &core.SocketAddress_PortValue{
+						PortValue: 80,
+					},
+				},
+			},
+		},
+		FilterChains: []*listener.FilterChain{
+			{
+				Filters: []*listener.Filter{
+					{
+						Name: "envoy.filters.network.http_connection_manager",
+						ConfigType: &listener.Filter_TypedConfig{
+							TypedConfig: pbst,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return []types.Resource{listener}
+}
+
+// Helper function to marshal protobuf messages to Any
+func mustMarshalAny(message interface{}) *anypb.Any {
+	any, err := anypb.New(message.(*router.Router))
+	if err != nil {
+		panic(fmt.Sprintf("failed to marshal message to Any: %v", err))
+	}
+	return any
+}
+
+// Implement server.Callbacks interface methods
 
 func (cp *ControlPlane) OnStreamOpen(ctx context.Context, id int64, typeURL string) error {
 	cp.streamsMu.Lock()
@@ -94,7 +310,45 @@ func (cp *ControlPlane) OnStreamOpen(ctx context.Context, id int64, typeURL stri
 		resources: make(map[string]types.Resource),
 	}
 
-	log.Printf("Stream %d opened for %s", id, typeURL)
+	cp.logger.Printf("Stream %d opened for %s", id, typeURL)
+	return nil
+}
+
+func (cp *ControlPlane) OnStreamClosed(id int64, node *core.Node) {
+	cp.streamsMu.Lock()
+	delete(cp.streams, id)
+	cp.streamsMu.Unlock()
+
+	cp.logger.Printf("Stream %d closed for node %s", id, node.GetId())
+}
+
+func (cp *ControlPlane) OnStreamRequest(id int64, req *discoveryv3.DiscoveryRequest) error {
+	nodeID := req.Node.GetId()
+	if nodeID == "" {
+		return fmt.Errorf("missing node ID in request")
+	}
+
+	cp.streamsMu.Lock()
+	if state, exists := cp.streams[id]; exists {
+		state.nodeID = nodeID
+		state.typeURL = req.TypeUrl
+	}
+	cp.streamsMu.Unlock()
+
+	_, err := cp.gcpCache.GetSnapshot(nodeID)
+	if err != nil {
+		newSnapshot, err := cp.createSnapshot(nil)
+		if err != nil {
+			return fmt.Errorf("failed to create initial snapshot: %w", err)
+		}
+
+		if err := cp.gcpCache.SetSnapshot(nodeID, newSnapshot); err != nil {
+			return fmt.Errorf("failed to set initial snapshot: %w", err)
+		}
+	}
+
+	cp.logger.Printf("Stream %d request processed for node %s, type %s",
+		id, nodeID, req.TypeUrl)
 	return nil
 }
 
@@ -105,199 +359,128 @@ func (cp *ControlPlane) OnStreamResponse(ctx context.Context, id int64, req *dis
 	}
 	cp.streamsMu.RUnlock()
 
-	log.Printf("Stream %d sent response version %s", id, res.VersionInfo)
-}
-
-func (cp *ControlPlane) OnStreamClosed(id int64, node *core.Node) {
-	cp.streamsMu.Lock()
-	delete(cp.streams, id)
-	cp.streamsMu.Unlock()
-
-	log.Printf("Stream %d closed for node %s", id, node.GetId())
-}
-
-func (cp *ControlPlane) createSnapshot(services []string) (*envoycache.Snapshot, error) {
-	version := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	// Create an empty snapshot
-	snapshot, err := envoycache.NewSnapshot(
-		version,
-		map[resource.Type][]types.Resource{
-			resource.ClusterType:  {},
-			resource.EndpointType: {},
-			resource.RouteType:    {},
-			resource.ListenerType: {},
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
-	}
-
-	// Validate the snapshot before returning
-	if err := snapshot.Consistent(); err != nil {
-		return nil, fmt.Errorf("inconsistent snapshot: %w", err)
-	}
-
-	return snapshot, nil
-}
-
-func (cp *ControlPlane) OnStreamRequest(id int64, req *discoveryv3.DiscoveryRequest) error {
-	nodeID := req.Node.GetId()
-	typeURL := req.TypeUrl
-
-	cp.streamsMu.Lock()
-	if state, exists := cp.streams[id]; exists {
-		state.nodeID = nodeID
-		state.typeURL = typeURL
-	}
-	cp.streamsMu.Unlock()
-
-	// Check if we have a snapshot for this node
-	_, err := cp.gcpCache.GetSnapshot(nodeID)
-	if err != nil {
-		// Create initial snapshot if none exists
-		newSnapshot, err := cp.createSnapshot(nil)
-		if err != nil {
-			return fmt.Errorf("failed to create initial snapshot: %w", err)
-		}
-
-		// The pointer to Snapshot implements ResourceSnapshot
-		if err := cp.gcpCache.SetSnapshot(nodeID, newSnapshot); err != nil {
-			return fmt.Errorf("failed to set initial snapshot: %w", err)
-		}
-	}
-
-	log.Printf("Stream %d received request from node %s for type %s", id, nodeID, typeURL)
-	return nil
-}
-
-// Add this method to your ControlPlane struct implementation
-func (cp *ControlPlane) OnDeltaStreamClosed(id int64, node *core.Node) {
-	// Acquire lock to safely modify the streams map
-	cp.streamsMu.Lock()
-	defer cp.streamsMu.Unlock()
-
-	// Clean up the stream state
-	delete(cp.streams, id)
-
-	// Log the delta stream closure
-	if node != nil {
-		log.Printf("Delta stream %d closed for node %s", id, node.GetId())
-	} else {
-		log.Printf("Delta stream %d closed for unknown node", id)
-	}
-
-	// You might want to perform additional cleanup here, such as:
-	// - Removing any delta-specific resources
-	// - Updating metrics
-	// - Notifying other components
-}
-
-func (cp *ControlPlane) OnDeltaStreamRequest(id int64, req *discoveryv3.DeltaDiscoveryRequest) error {
-	nodeID := req.Node.GetId()
-	typeURL := req.TypeUrl
-
-	cp.streamsMu.Lock()
-	if state, exists := cp.streams[id]; exists {
-		state.nodeID = nodeID
-		state.typeURL = typeURL
-	}
-	cp.streamsMu.Unlock()
-
-	log.Printf("Delta stream %d received request from node %s for type %s", id, nodeID, typeURL)
-	return nil
-}
-
-func (cp *ControlPlane) OnDeltaStreamResponse(id int64, req *discoveryv3.DeltaDiscoveryRequest, res *discoveryv3.DeltaDiscoveryResponse) {
-	cp.streamsMu.RLock()
-	if state, exists := cp.streams[id]; exists {
-		state.version = res.SystemVersionInfo
-	}
-	cp.streamsMu.RUnlock()
-
-	log.Printf("Delta stream %d sent response version %s", id, res.SystemVersionInfo)
+	cp.logger.Printf("Stream %d sent response version %s", id, res.VersionInfo)
 }
 
 func (cp *ControlPlane) OnDeltaStreamOpen(ctx context.Context, id int64, typeURL string) error {
-	// First, acquire a lock since we'll be modifying shared state
 	cp.streamsMu.Lock()
 	defer cp.streamsMu.Unlock()
 
-	// Initialize a new stream state for this delta stream
 	cp.streams[id] = &streamState{
 		typeURL:   typeURL,
 		resources: make(map[string]types.Resource),
 	}
 
-	// Log the new delta stream connection
-	log.Printf("Delta stream %d opened for type %s", id, typeURL)
+	cp.logger.Printf("Delta stream %d opened for type %s", id, typeURL)
+	return nil
+}
 
-	// Here you could add additional initialization like:
-	// - Setting up stream-specific resources
-	// - Initializing metrics
-	// - Recording stream metadata
+func (cp *ControlPlane) OnDeltaStreamClosed(id int64, node *core.Node) {
+	cp.streamsMu.Lock()
+	delete(cp.streams, id)
+	cp.streamsMu.Unlock()
+
+	if node != nil {
+		cp.logger.Printf("Delta stream %d closed for node %s", id, node.GetId())
+	} else {
+		cp.logger.Printf("Delta stream %d closed for unknown node", id)
+	}
+}
+
+func (cp *ControlPlane) OnStreamDeltaRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) error {
+	cp.logger.Printf("Stream %d received delta request from node %s for type %s",
+		streamID, req.Node.GetId(), req.TypeUrl)
+
+	if len(req.ResourceNamesSubscribe) > 0 {
+		cp.logger.Printf("Client subscribing to resources: %v", req.ResourceNamesSubscribe)
+	}
+	if len(req.ResourceNamesUnsubscribe) > 0 {
+		cp.logger.Printf("Client unsubscribing from resources: %v", req.ResourceNamesUnsubscribe)
+	}
+
+	// Update stream state with the latest information
+	cp.streamsMu.Lock()
+	if state, exists := cp.streams[streamID]; exists {
+		state.nodeID = req.Node.GetId()
+		state.typeURL = req.TypeUrl
+	}
+	cp.streamsMu.Unlock()
 
 	return nil
 }
 
-// OnFetchRequest is called when an Envoy client makes a synchronous (non-streaming) request
-// for configuration data. The context allows for cancellation and timeouts, while the
-// DiscoveryRequest contains details about what configuration the client is requesting.
+func (cp *ControlPlane) OnStreamDeltaResponse(streamID int64, req *discoveryv3.DeltaDiscoveryRequest, res *discoveryv3.DeltaDiscoveryResponse) {
+	cp.logger.Printf("Stream %d sending delta response to node %s for type %s (version: %s)",
+		streamID, req.Node.GetId(), req.TypeUrl, res.SystemVersionInfo)
+
+	// Log resource changes
+	if len(res.Resources) > 0 {
+		cp.logger.Printf("Sending %d updated resources", len(res.Resources))
+	}
+	if len(res.RemovedResources) > 0 {
+		cp.logger.Printf("Removing %d resources", len(res.RemovedResources))
+	}
+
+	// Update stream version information
+	cp.streamsMu.RLock()
+	if state, exists := cp.streams[streamID]; exists {
+		state.version = res.SystemVersionInfo
+	}
+	cp.streamsMu.RUnlock()
+}
+
 func (cp *ControlPlane) OnFetchRequest(ctx context.Context, req *discoveryv3.DiscoveryRequest) error {
-	// Log the fetch request with basic information about what the client is asking for
-	log.Printf("Received fetch request from node %s for resource type %s",
-		req.Node.GetId(), req.TypeUrl)
+	if req.Node == nil || req.Node.GetId() == "" {
+		return fmt.Errorf("missing or invalid node in fetch request")
+	}
+
+	cp.logger.Printf("Received fetch request from node %s for type %s (version: %s)",
+		req.Node.GetId(), req.TypeUrl, req.VersionInfo)
+
+	// Check if we have a snapshot for this node
+	_, err := cp.gcpCache.GetSnapshot(req.Node.GetId())
+	if err != nil {
+		cp.logger.Printf("No existing snapshot for node %s, creating initial configuration",
+			req.Node.GetId())
+	}
 
 	return nil
 }
 
-// OnFetchResponse is called after the server has prepared and is about to send
-// a response to a fetch request. This gives us a chance to inspect or modify
-// the response before it goes out.
 func (cp *ControlPlane) OnFetchResponse(req *discoveryv3.DiscoveryRequest, resp *discoveryv3.DiscoveryResponse) {
-	// Log information about the response being sent
-	log.Printf("Sending fetch response to node %s for type %s with version %s",
+	cp.logger.Printf("Sending fetch response to node %s for type %s (version: %s, resources: %d)",
 		req.Node.GetId(),
 		req.TypeUrl,
-		resp.VersionInfo)
+		resp.VersionInfo,
+		len(resp.Resources))
 }
 
-// OnStreamDeltaRequest handles incremental configuration requests from Envoy clients.
-// It's called whenever an Envoy instance wants to update its configuration using the delta xDS protocol.
-func (cp *ControlPlane) OnStreamDeltaRequest(streamID int64, request *discoveryv3.DeltaDiscoveryRequest) error {
-	// Log the incoming delta request with useful debugging information
-	log.Printf("Stream %d received delta request from node %s for type %s",
-		streamID,
-		request.Node.GetId(),
-		request.TypeUrl)
+// Cleanup performs necessary cleanup when shutting down the control plane
+func (cp *ControlPlane) Cleanup(ctx context.Context) error {
+	cp.logger.Println("Starting control plane cleanup")
 
-	// Here we could track what resources the client wants to add or remove
-	if len(request.ResourceNamesSubscribe) > 0 {
-		log.Printf("Client subscribing to resources: %v", request.ResourceNamesSubscribe)
-	}
-	if len(request.ResourceNamesUnsubscribe) > 0 {
-		log.Printf("Client unsubscribing from resources: %v", request.ResourceNamesUnsubscribe)
-	}
+	// Clean up all active streams
+	cp.streamsMu.Lock()
+	cp.streams = make(map[int64]*streamState)
+	cp.streamsMu.Unlock()
 
+	// Additional cleanup tasks can be added here
+	// For example:
+	// - Close connections
+	// - Flush caches
+	// - Save state
+
+	cp.logger.Println("Control plane cleanup completed")
 	return nil
 }
 
-// OnStreamDeltaResponse is called just before the server sends a delta configuration
-// response to an Envoy client. This method gives us visibility into what configuration
-// changes are being sent to each client.
-func (cp *ControlPlane) OnStreamDeltaResponse(streamID int64, request *discoveryv3.DeltaDiscoveryRequest, response *discoveryv3.DeltaDiscoveryResponse) {
-	// Log information about what configuration updates we're sending to the client
-	log.Printf("Stream %d sending delta response to node %s for type %s (version: %s)",
-		streamID,
-		request.Node.GetId(),
-		request.TypeUrl,
-		response.SystemVersionInfo)
-
-	// We can also log details about what resources are being added or removed
-	if len(response.Resources) > 0 {
-		log.Printf("Sending %d updated resources", len(response.Resources))
+// Helper method to validate node information
+func (cp *ControlPlane) validateNode(node *core.Node) error {
+	if node == nil {
+		return fmt.Errorf("nil node")
 	}
-	if len(response.RemovedResources) > 0 {
-		log.Printf("Removing %d resources", len(response.RemovedResources))
+	if node.GetId() == "" {
+		return fmt.Errorf("empty node ID")
 	}
+	return nil
 }

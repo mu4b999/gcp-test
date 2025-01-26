@@ -3,6 +3,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
+	"github.com/mu4b999/gcp-test/pkg/watcher"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -233,4 +235,45 @@ func (rc *RedisCache) Close() error {
 
 func (rc *RedisCache) Ping(ctx context.Context) error {
 	return rc.client.Ping(ctx).Err()
+}
+
+func (rc *RedisCache) StoreServiceEndpoints(ctx context.Context, service watcher.ServiceDiscovery) error {
+	// Create a key for this service's endpoints
+	key := fmt.Sprintf("endpoints:%s", service.ServiceName)
+
+	// Marshal the endpoints to JSON
+	data, err := json.Marshal(service.Endpoints)
+	if err != nil {
+		return fmt.Errorf("failed to marshal endpoints: %w", err)
+	}
+
+	// Store in Redis with some TTL
+	return rc.client.Set(ctx, key, data, 1*time.Hour).Err()
+}
+
+func (rc *RedisCache) StoreVersionInfo(ctx context.Context, nodeID, version string) error {
+	key := fmt.Sprintf("version:%s", nodeID)
+	return rc.client.Set(ctx, key, version, 24*time.Hour).Err()
+}
+
+func (rc *RedisCache) BackupSnapshot(ctx context.Context, nodeID string) error {
+	snapshot, err := rc.GetSnapshot(nodeID)
+	if err != nil {
+		return err
+	}
+
+	// Store backup in Redis with timestamp
+	backupKey := fmt.Sprintf("backup:%s:%d", nodeID, time.Now().Unix())
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+
+	return rc.client.Set(ctx, backupKey, data, 7*24*time.Hour).Err()
+}
+
+// In your Redis cache
+func (rc *RedisCache) GetSnapshotHistory(ctx context.Context, nodeID string) ([]string, error) {
+	pattern := fmt.Sprintf("backup:%s:*", nodeID)
+	return rc.client.Keys(ctx, pattern).Result()
 }

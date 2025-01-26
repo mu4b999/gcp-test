@@ -6,8 +6,19 @@ import (
 	"time"
 )
 
+type ServiceEndpoint struct {
+	IP       string
+	Port     uint32
+	Metadata map[string]string
+}
+
+type ServiceDiscovery struct {
+	ServiceName string
+	Endpoints   []ServiceEndpoint
+}
+
 type ServiceWatcher interface {
-	WatchServices(ctx context.Context, interval time.Duration) <-chan []string
+	WatchServices(ctx context.Context, interval time.Duration) <-chan []ServiceDiscovery
 }
 
 type GCPServiceWatcher struct {
@@ -20,8 +31,8 @@ func NewServiceWatcher(ctx context.Context, projectID string) *GCPServiceWatcher
 	}
 }
 
-func (w *GCPServiceWatcher) WatchServices(ctx context.Context, interval time.Duration) <-chan []string {
-	ch := make(chan []string)
+func (w *GCPServiceWatcher) WatchServices(ctx context.Context, interval time.Duration) <-chan []ServiceDiscovery {
+	ch := make(chan []ServiceDiscovery)
 
 	go func() {
 		defer close(ch)
@@ -46,10 +57,26 @@ func (w *GCPServiceWatcher) WatchServices(ctx context.Context, interval time.Dur
 	return ch
 }
 
-func (w *GCPServiceWatcher) fetchServices(context.Context) ([]string, error) {
-	// For now, return mock services. In production, you would:
-	// 1. Query GCP APIs to get service list
-	// 2. Filter based on criteria
-	// 3. Transform into the required format
-	return []string{"service1", "service2"}, nil
+func (w *GCPServiceWatcher) fetchServices(ctx context.Context) ([]ServiceDiscovery, error) {
+	// Here you would actually query your infrastructure (e.g., GCP API)
+	// to get service instances and their endpoints
+
+	// Example of what real discovery might return:
+	services := []ServiceDiscovery{
+		{
+			ServiceName: "payment-service",
+			Endpoints: []ServiceEndpoint{
+				{IP: "10.0.1.1", Port: 8080},
+				{IP: "10.0.1.2", Port: 8080},
+			},
+		},
+		{
+			ServiceName: "auth-service",
+			Endpoints: []ServiceEndpoint{
+				{IP: "10.0.2.1", Port: 9090},
+				{IP: "10.0.2.2", Port: 9090},
+			},
+		},
+	}
+	return services, nil
 }
