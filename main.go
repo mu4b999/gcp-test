@@ -11,8 +11,6 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/mu4b999/gcp-test/pkg/cache"
 	"github.com/mu4b999/gcp-test/pkg/controlplane"
-
-	// "github.com/mu4b999/gcp-test/pkg/snapshotter"
 	"github.com/mu4b999/gcp-test/pkg/watcher"
 	"google.golang.org/grpc"
 )
@@ -20,14 +18,6 @@ import (
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Create a graceful shutdown mechanism
-	// go func() {
-	// 	sigCh := make(chan os.Signal, 1)
-	// 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	// 	<-sigCh
-	// 	cancel()
-	// }()
 
 	redisConfig := cache.Config{
 		Addr:         "localhost:6379",
@@ -41,9 +31,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize Redis cache: %v", err)
 	}
-
-	// Initialize your snapshotter with the cache
-	// snapshotter := snapshotter.NewGCPSnapshotter(ctx, "my-project")
 
 	// Setup watchers
 	watcher := watcher.NewServiceWatcher(ctx, "my-project")

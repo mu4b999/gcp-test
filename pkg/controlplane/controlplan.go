@@ -28,7 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// ControlPlane manages the xDS server and configuration distribution.
+// // ControlPlane manages the xDS server and configuration distribution.
 type ControlPlane struct {
 	gcpCache       rediscache.RedisCache  // Interface for configuration storage
 	serviceWatcher watcher.ServiceWatcher // Watches for service changes
@@ -37,12 +37,18 @@ type ControlPlane struct {
 	logger         *log.Logger            // Structured logging
 }
 
-// streamState tracks the state of individual xDS streams.
-type streamState struct {
-	nodeID    string
-	typeURL   string
-	version   string
-	resources map[string]types.Resource
+// convertResources converts a map of resources to a slice of *anypb.Any.
+func convertResources(resources map[string]types.Resource) []*anypb.Any {
+	anyResources := make([]*anypb.Any, 0, len(resources))
+	for _, resource := range resources {
+		anyResource, err := anypb.New(resource)
+		if err != nil {
+			log.Printf("Failed to convert resource to Any: %v", err)
+			continue
+		}
+		anyResources = append(anyResources, anyResource)
+	}
+	return anyResources
 }
 
 // NewControlPlane creates a new control plane instance with proper initialization.
@@ -86,19 +92,76 @@ func (cp *ControlPlane) watchServices(ctx context.Context) {
 
 // handleServiceUpdate processes service updates and updates configurations accordingly.
 func (cp *ControlPlane) handleServiceUpdate(ctx context.Context, services []watcher.ServiceDiscovery) error {
+	// Create a new snapshot based on the updated services
 	snapshot, err := cp.createSnapshot(services)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
+	// Push the new snapshot to all relevant Envoy proxies
 	cp.streamsMu.RLock()
 	defer cp.streamsMu.RUnlock()
 
 	for _, state := range cp.streams {
-		if err := cp.gcpCache.SetSnapshot(state.nodeID, snapshot); err != nil {
-			cp.logger.Printf("Failed to update snapshot for node %s: %v", state.nodeID, err)
+		if err := cp.PushUpdate(state.nodeID, snapshot); err != nil {
+			cp.logger.Printf("Failed to push update to node %s: %v", state.nodeID, err)
 		}
 	}
+
+	return nil
+}
+
+// PushUpdate sends a new configuration snapshot to a specific node
+func (cp *ControlPlane) PushUpdate(nodeID string, newSnapshot envoycache.ResourceSnapshot) error {
+	// Instead of managing streams directly, use the cache to handle distribution
+	if err := cp.gcpCache.SetSnapshot(nodeID, newSnapshot); err != nil {
+		return fmt.Errorf("failed to set snapshot for node %s: %w", nodeID, err)
+	}
+
+	cp.logger.Printf("Successfully set new snapshot for node %s", nodeID)
+	return nil
+}
+
+// PushUpdate sends a new configuration snapshot to all Envoy proxies for a given nodeID.
+func (cp *ControlPlane) PushUpdate2(nodeID string, newSnapshot envoycache.ResourceSnapshot) error {
+	cp.streamsMu.RLock()
+	defer cp.streamsMu.RUnlock()
+
+	// Iterate over all streams for the given nodeID
+	for streamID, state := range cp.streams {
+		if state.nodeID == nodeID {
+			// Create a DiscoveryResponse from the new snapshot
+			res := &discoveryv3.DiscoveryResponse{
+				VersionInfo: newSnapshot.GetVersion(state.typeURL),
+				TypeUrl:     state.typeURL,
+				Resources:   convertResources(newSnapshot.GetResources(state.typeURL)),
+			}
+
+			// Send the response to the Envoy proxy
+			if err := cp.sendResponse(streamID, res); err != nil {
+				cp.logger.Printf("Failed to push update to stream %d: %v", streamID, err)
+			} else {
+				cp.logger.Printf("Pushed update to stream %d for node %s, version %s",
+					streamID, nodeID, newSnapshot.GetVersion(state.typeURL))
+			}
+		}
+	}
+
+	return nil
+}
+
+// sendResponse sends a DiscoveryResponse to the Envoy proxy over the gRPC stream.
+func (cp *ControlPlane) sendResponse(streamID int64, res *discoveryv3.DiscoveryResponse) error {
+	cp.streamsMu.RLock()
+	defer cp.streamsMu.RUnlock()
+
+	// if state, exists := cp.streams[streamID]; exists {
+	// 	if err := state.stream.Send(res); err != nil {
+	// 		return fmt.Errorf("failed to send response to stream %d: %w", streamID, err)
+	// 	}
+	// } else {
+	// 	return fmt.Errorf("stream %d not found", streamID)
+	// }
 
 	return nil
 }
@@ -297,190 +360,4 @@ func mustMarshalAny(message interface{}) *anypb.Any {
 		panic(fmt.Sprintf("failed to marshal message to Any: %v", err))
 	}
 	return any
-}
-
-// Implement server.Callbacks interface methods
-
-func (cp *ControlPlane) OnStreamOpen(ctx context.Context, id int64, typeURL string) error {
-	cp.streamsMu.Lock()
-	defer cp.streamsMu.Unlock()
-
-	cp.streams[id] = &streamState{
-		typeURL:   typeURL,
-		resources: make(map[string]types.Resource),
-	}
-
-	cp.logger.Printf("Stream %d opened for %s", id, typeURL)
-	return nil
-}
-
-func (cp *ControlPlane) OnStreamClosed(id int64, node *core.Node) {
-	cp.streamsMu.Lock()
-	delete(cp.streams, id)
-	cp.streamsMu.Unlock()
-
-	cp.logger.Printf("Stream %d closed for node %s", id, node.GetId())
-}
-
-func (cp *ControlPlane) OnStreamRequest(id int64, req *discoveryv3.DiscoveryRequest) error {
-	nodeID := req.Node.GetId()
-	if nodeID == "" {
-		return fmt.Errorf("missing node ID in request")
-	}
-
-	cp.streamsMu.Lock()
-	if state, exists := cp.streams[id]; exists {
-		state.nodeID = nodeID
-		state.typeURL = req.TypeUrl
-	}
-	cp.streamsMu.Unlock()
-
-	_, err := cp.gcpCache.GetSnapshot(nodeID)
-	if err != nil {
-		newSnapshot, err := cp.createSnapshot(nil)
-		if err != nil {
-			return fmt.Errorf("failed to create initial snapshot: %w", err)
-		}
-
-		if err := cp.gcpCache.SetSnapshot(nodeID, newSnapshot); err != nil {
-			return fmt.Errorf("failed to set initial snapshot: %w", err)
-		}
-	}
-
-	cp.logger.Printf("Stream %d request processed for node %s, type %s",
-		id, nodeID, req.TypeUrl)
-	return nil
-}
-
-func (cp *ControlPlane) OnStreamResponse(ctx context.Context, id int64, req *discoveryv3.DiscoveryRequest, res *discoveryv3.DiscoveryResponse) {
-	cp.streamsMu.RLock()
-	if state, exists := cp.streams[id]; exists {
-		state.version = res.VersionInfo
-	}
-	cp.streamsMu.RUnlock()
-
-	cp.logger.Printf("Stream %d sent response version %s", id, res.VersionInfo)
-}
-
-func (cp *ControlPlane) OnDeltaStreamOpen(ctx context.Context, id int64, typeURL string) error {
-	cp.streamsMu.Lock()
-	defer cp.streamsMu.Unlock()
-
-	cp.streams[id] = &streamState{
-		typeURL:   typeURL,
-		resources: make(map[string]types.Resource),
-	}
-
-	cp.logger.Printf("Delta stream %d opened for type %s", id, typeURL)
-	return nil
-}
-
-func (cp *ControlPlane) OnDeltaStreamClosed(id int64, node *core.Node) {
-	cp.streamsMu.Lock()
-	delete(cp.streams, id)
-	cp.streamsMu.Unlock()
-
-	if node != nil {
-		cp.logger.Printf("Delta stream %d closed for node %s", id, node.GetId())
-	} else {
-		cp.logger.Printf("Delta stream %d closed for unknown node", id)
-	}
-}
-
-func (cp *ControlPlane) OnStreamDeltaRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) error {
-	cp.logger.Printf("Stream %d received delta request from node %s for type %s",
-		streamID, req.Node.GetId(), req.TypeUrl)
-
-	if len(req.ResourceNamesSubscribe) > 0 {
-		cp.logger.Printf("Client subscribing to resources: %v", req.ResourceNamesSubscribe)
-	}
-	if len(req.ResourceNamesUnsubscribe) > 0 {
-		cp.logger.Printf("Client unsubscribing from resources: %v", req.ResourceNamesUnsubscribe)
-	}
-
-	// Update stream state with the latest information
-	cp.streamsMu.Lock()
-	if state, exists := cp.streams[streamID]; exists {
-		state.nodeID = req.Node.GetId()
-		state.typeURL = req.TypeUrl
-	}
-	cp.streamsMu.Unlock()
-
-	return nil
-}
-
-func (cp *ControlPlane) OnStreamDeltaResponse(streamID int64, req *discoveryv3.DeltaDiscoveryRequest, res *discoveryv3.DeltaDiscoveryResponse) {
-	cp.logger.Printf("Stream %d sending delta response to node %s for type %s (version: %s)",
-		streamID, req.Node.GetId(), req.TypeUrl, res.SystemVersionInfo)
-
-	// Log resource changes
-	if len(res.Resources) > 0 {
-		cp.logger.Printf("Sending %d updated resources", len(res.Resources))
-	}
-	if len(res.RemovedResources) > 0 {
-		cp.logger.Printf("Removing %d resources", len(res.RemovedResources))
-	}
-
-	// Update stream version information
-	cp.streamsMu.RLock()
-	if state, exists := cp.streams[streamID]; exists {
-		state.version = res.SystemVersionInfo
-	}
-	cp.streamsMu.RUnlock()
-}
-
-func (cp *ControlPlane) OnFetchRequest(ctx context.Context, req *discoveryv3.DiscoveryRequest) error {
-	if req.Node == nil || req.Node.GetId() == "" {
-		return fmt.Errorf("missing or invalid node in fetch request")
-	}
-
-	cp.logger.Printf("Received fetch request from node %s for type %s (version: %s)",
-		req.Node.GetId(), req.TypeUrl, req.VersionInfo)
-
-	// Check if we have a snapshot for this node
-	_, err := cp.gcpCache.GetSnapshot(req.Node.GetId())
-	if err != nil {
-		cp.logger.Printf("No existing snapshot for node %s, creating initial configuration",
-			req.Node.GetId())
-	}
-
-	return nil
-}
-
-func (cp *ControlPlane) OnFetchResponse(req *discoveryv3.DiscoveryRequest, resp *discoveryv3.DiscoveryResponse) {
-	cp.logger.Printf("Sending fetch response to node %s for type %s (version: %s, resources: %d)",
-		req.Node.GetId(),
-		req.TypeUrl,
-		resp.VersionInfo,
-		len(resp.Resources))
-}
-
-// Cleanup performs necessary cleanup when shutting down the control plane
-func (cp *ControlPlane) Cleanup(ctx context.Context) error {
-	cp.logger.Println("Starting control plane cleanup")
-
-	// Clean up all active streams
-	cp.streamsMu.Lock()
-	cp.streams = make(map[int64]*streamState)
-	cp.streamsMu.Unlock()
-
-	// Additional cleanup tasks can be added here
-	// For example:
-	// - Close connections
-	// - Flush caches
-	// - Save state
-
-	cp.logger.Println("Control plane cleanup completed")
-	return nil
-}
-
-// Helper method to validate node information
-func (cp *ControlPlane) validateNode(node *core.Node) error {
-	if node == nil {
-		return fmt.Errorf("nil node")
-	}
-	if node.GetId() == "" {
-		return fmt.Errorf("empty node ID")
-	}
-	return nil
 }
